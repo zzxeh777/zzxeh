@@ -1,0 +1,21 @@
+# 基础依赖
+Flask>=2.3.0
+Flask-CORS>=4.0.0
+Werkzeug>=2.3.0
+
+# 深度学习库 (Python 3.12 兼容版本)
+torch>=2.2.0
+torchvision>=0.17.0
+numpy>=1.26.0
+
+# 图像处理
+Pillow>=10.0.0
+
+# PE文件解析
+pefile>=2023.2.7
+
+# 服务器
+hypercorn>=0.17.0
+
+# 其他
+waitress>=3.0.0

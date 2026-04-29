@@ -1,0 +1,417 @@
+"""
+深度学习模型模块 - 优化版
+引入特征组注意力机制 (Feature Group Attention)
+实现特征组合优化与场景适配
+
+注意：本模块仅支持特征级检测模型
+图像级检测模型（SimpleCNN、EfficientNet、ViT）用于 BIG 2015 数据集，需单独训练
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Tuple, Dict
+
+class FeatureGroupAttention(nn.Module):
+    """
+    特征组注意力模块：实现组合优化
+    将高维特征分为不同的逻辑组，动态计算每组的权重
+    """
+    def __init__(self, group_dims: Dict[str, int], embed_dim: int = 64):
+        super(FeatureGroupAttention, self).__init__()
+        self.groups = nn.ModuleDict()
+        
+        # 为每个特征组建立一个编码层
+        for name, dim in group_dims.items():
+            self.groups[name] = nn.Sequential(
+                nn.Linear(dim, embed_dim),
+                nn.ReLU()
+            )
+        
+        # 注意力计算层：根据各组编码后的特征生成权重
+        num_groups = len(group_dims)
+        self.attention_net = nn.Sequential(
+            nn.Linear(embed_dim * num_groups, num_groups),
+            nn.Softmax(dim=1)  # 保证各组权重之和为1
+        )
+
+    def forward(self, x_dict: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        group_embeddings = []
+        for name, net in self.groups.items():
+            group_embeddings.append(net(x_dict[name]))
+        
+        # 拼接所有组的嵌入向量
+        combined = torch.cat(group_embeddings, dim=1) # [batch, embed_dim * num_groups]
+        
+        # 计算组权重 (场景适配的核心：不同样本生成的权重不同)
+        weights = self.attention_net(combined) # [batch, num_groups]
+        
+        # 加权融合
+        weighted_embeddings = []
+        for i, (name, _) in enumerate(self.groups.items()):
+            # 将权重作用于对应组的嵌入
+            w = weights[:, i:i+1] 
+            weighted_embeddings.append(group_embeddings[i] * w)
+            
+        final_embedding = torch.sum(torch.stack(weighted_embeddings, dim=2), dim=2)
+        return final_embedding, weights
+
+class OptimizedMalwareDetector(nn.Module):
+    """
+    基于注意力机制的组合优化恶意软件检测模型
+    仅支持PE特征输入，用于EMBER数据集的二分类任务
+
+    特征分组基于 EMBER 官方 features.py (v2):
+    - ByteHistogram: 256维 [0:256]
+    - ByteEntropyHistogram: 256维 [256:512]
+    - StringExtractor: 104维 [512:616] (numstrings+avlength+printables+96-bin histogram+entropy+paths+urls+registry+MZ)
+    - General (其余): 1765维 [616:2381] (GeneralFileInfo+HeaderFileInfo+SectionInfo+ImportsInfo+ExportsInfo+DataDirectories)
+
+    修复：增强classifier结构，提高模型表达能力
+    """
+    def __init__(self, num_classes: int = 2, embed_dim: int = 64):
+        super(OptimizedMalwareDetector, self).__init__()
+
+        # 定义 PE 特征的逻辑分组 (EMBER v2 2381 维官方标准)
+        # Histogram(256) + ByteEntropy(256) + Strings(104) + General(1765) = 2381
+        self.group_dims = {
+            'histogram': 256,       # ByteHistogram
+            'byte_entropy': 256,    # ByteEntropyHistogram
+            'strings': 104,         # StringExtractor (1+1+1+96+1+1+1+1+1)
+            'general': 1765         # GeneralFileInfo+HeaderFileInfo+SectionInfo+ImportsInfo+ExportsInfo+DataDirectories
+        }
+
+        self.embed_dim = embed_dim
+
+        # 1. 组合优化层（增强：添加更多正则化）
+        self.attention_module = FeatureGroupAttention(self.group_dims, embed_dim=embed_dim)
+
+        # 2. 增强的深度分类层（关键修复：增加层数和维度）
+        self.classifier = nn.Sequential(
+            # 第一层：扩大维度
+            nn.Linear(embed_dim, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+
+            # 第二层：压缩
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+
+            # 第三层：输出
+            nn.Linear(128, num_classes)
+        )
+
+        # 参数统计
+        self._print_params()
+
+    def _print_params(self):
+        """打印模型参数量"""
+        total_params = sum(p.numel() for p in self.parameters())
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        print(f"OptimizedMalwareDetector: 总参数={total_params:,}, 可训练={trainable_params:,}")
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # 将原始向量拆分回逻辑组 (EMBER v2 2381 维官方标准)
+        # Histogram(256) + ByteEntropy(256) + Strings(104) + General(1765)
+        x_dict = {
+            'histogram': x[:, 0:256],
+            'byte_entropy': x[:, 256:512],
+            'strings': x[:, 512:616],  # StringExtractor 104维
+            'general': x[:, 616:2381]  # 剩余特征 1765维
+        }
+
+        # 组合优化与特征融合
+        feat_embedding, attn_weights = self.attention_module(x_dict)
+
+        # 分类
+        logits = self.classifier(feat_embedding)
+        return logits, attn_weights
+
+
+class OptimizedAPKDetector(nn.Module):
+    """
+    基于注意力机制的组合优化恶意软件检测模型（APK版本）
+    结构与 OptimizedMalwareDetector 相同，用于兼容命名
+
+    特征分组基于 EMBER 官方 features.py (v2):
+    - ByteHistogram: 256维 [0:256]
+    - ByteEntropyHistogram: 256维 [256:512]
+    - StringExtractor: 104维 [512:616]
+    - General: 1765维 [616:2381]
+    """
+    def __init__(self, num_classes: int = 2):
+        super(OptimizedAPKDetector, self).__init__()
+
+        # 定义 EMBER 特征的逻辑分组 (EMBER v2 2381 维官方标准)
+        self.group_dims = {
+            'histogram': 256,
+            'byte_entropy': 256,
+            'strings': 104,         # StringExtractor
+            'general': 1765         # 剩余特征
+        }
+
+        # 1. 组合优化层
+        self.attention_module = FeatureGroupAttention(self.group_dims)
+
+        # 2. 深度分类层 (场景适配推理)
+        self.classifier = nn.Sequential(
+            nn.Linear(64, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, num_classes)
+        )
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # 将原始 2381 维向量拆分回逻辑组 (EMBER v2 官方标准)
+        x_dict = {
+            'histogram': x[:, 0:256],
+            'byte_entropy': x[:, 256:512],
+            'strings': x[:, 512:616],   # 104维
+            'general': x[:, 616:2381]   # 1765维
+        }
+
+        # 组合优化与特征融合
+        feat_embedding, attn_weights = self.attention_module(x_dict)
+
+        # 分类
+        logits = self.classifier(feat_embedding)
+        return logits, attn_weights
+
+# 保持与你原有 app.py 的兼容性，保留基础 MLP 但建议在 app.py 中切换为 OptimizedAPKDetector
+class EmberMLP(nn.Module):
+    """EMBER 标准 MLP 模型 (2381 维输入) - 基线模型A"""
+    def __init__(self, input_dim=2381, num_classes=2):
+        super(EmberMLP, self).__init__()
+        self.model = nn.Sequential(
+            nn.Linear(input_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Linear(128, num_classes)
+        )
+    def forward(self, x):
+        return self.model(x)
+
+
+class EmberCNN1D(nn.Module):
+    """
+    EMBER 1D-CNN 基线模型 - 基线模型B
+    将2381维特征视为序列，用1D卷积捕捉局部模式
+    """
+    def __init__(self, input_dim=2381, num_classes=2):
+        super(EmberCNN1D, self).__init__()
+
+        # 1D卷积层：捕捉相邻特征的局部模式
+        self.conv1 = nn.Conv1d(1, 64, kernel_size=7, padding=3)
+        self.bn1 = nn.BatchNorm1d(64)
+        self.conv2 = nn.Conv1d(64, 128, kernel_size=5, padding=2)
+        self.bn2 = nn.BatchNorm1d(128)
+        self.conv3 = nn.Conv1d(128, 256, kernel_size=3, padding=1)
+        self.bn3 = nn.BatchNorm1d(256)
+
+        # 全局池化 + 分类头
+        self.global_pool = nn.AdaptiveMaxPool1d(1)
+        self.classifier = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, num_classes)
+        )
+
+    def forward(self, x):
+        # 输入: [batch, 2381] -> [batch, 1, 2381] (添加通道维度)
+        x = x.unsqueeze(1)
+
+        # 卷积层
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = F.relu(self.bn3(self.conv3(x)))
+
+        # 全局池化
+        x = self.global_pool(x).squeeze(-1)  # [batch, 256]
+
+        # 分类
+        x = self.classifier(x)
+        return x
+
+# 你原有的 CNN 模型保持不变...
+class MalwareDetectionCNN(nn.Module):
+    def __init__(self, num_classes: int = 9, dropout_rate: float = 0.5):
+        super(MalwareDetectionCNN, self).__init__()
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(32)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.fc = nn.Linear(32 * 112 * 112, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.pool(F.relu(self.bn1(self.conv1(x))))
+        x = x.view(x.size(0), -1)
+        return self.fc(x)
+
+
+class EfficientNetMalwareDetector(nn.Module):
+    """
+    基于EfficientNet的恶意软件检测模型
+    适用于二进制文件转换的图像输入
+    """
+    def __init__(self, num_classes: int = 9):
+        super(EfficientNetMalwareDetector, self).__init__()
+        
+        # 简化版EfficientNet结构
+        self.features = nn.Sequential(
+            # 第一层
+            nn.Conv2d(1, 32, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            
+            # MBConv1
+            self._mbconv_block(32, 16, 1),
+            
+            # MBConv6
+            self._mbconv_block(16, 24, 2),
+            self._mbconv_block(24, 24, 1),
+            
+            # MBConv6
+            self._mbconv_block(24, 40, 2),
+            self._mbconv_block(40, 40, 1),
+            
+            # MBConv6
+            self._mbconv_block(40, 80, 2),
+            self._mbconv_block(80, 80, 1),
+            self._mbconv_block(80, 80, 1),
+            
+            # MBConv6
+            self._mbconv_block(80, 112, 1),
+            self._mbconv_block(112, 112, 1),
+            self._mbconv_block(112, 112, 1),
+            
+            # MBConv6
+            self._mbconv_block(112, 192, 2),
+            self._mbconv_block(192, 192, 1),
+            self._mbconv_block(192, 192, 1),
+            self._mbconv_block(192, 192, 1),
+            
+            # MBConv6
+            self._mbconv_block(192, 320, 1),
+            
+            # 最后一层
+            nn.Conv2d(320, 1280, kernel_size=1),
+            nn.BatchNorm2d(1280),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d(1)
+        )
+        
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.3),
+            nn.Linear(1280, num_classes)
+        )
+    
+    def _mbconv_block(self, in_channels, out_channels, stride):
+        """Mobile Inverted Bottleneck Conv Block"""
+        expand_ratio = 6
+        hidden_dim = in_channels * expand_ratio
+        
+        layers = []
+        
+        # 扩展卷积
+        if expand_ratio != 1:
+            layers.extend([
+                nn.Conv2d(in_channels, hidden_dim, kernel_size=1),
+                nn.BatchNorm2d(hidden_dim),
+                nn.ReLU()
+            ])
+        
+        # 深度可分离卷积
+        layers.extend([
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, stride=stride, padding=1, groups=hidden_dim),
+            nn.BatchNorm2d(hidden_dim),
+            nn.ReLU()
+        ])
+        
+        # 投影卷积
+        layers.extend([
+            nn.Conv2d(hidden_dim, out_channels, kernel_size=1),
+            nn.BatchNorm2d(out_channels)
+        ])
+        
+        # 短接连接
+        if stride == 1 and in_channels == out_channels:
+            return nn.Sequential(*layers)
+        else:
+            return nn.Sequential(*layers)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.features(x)
+        x = x.view(x.size(0), -1)
+        x = self.classifier(x)
+        return x
+
+
+class ViTMalwareDetector(nn.Module):
+    """
+    基于Vision Transformer的恶意软件检测模型
+    适用于二进制文件转换的图像输入
+    """
+    def __init__(self, num_classes: int = 9, image_size: int = 224, patch_size: int = 16, dim: int = 768, depth: int = 12, heads: int = 12, mlp_dim: int = 3072):
+        super(ViTMalwareDetector, self).__init__()
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.num_patches = (image_size // patch_size) ** 2
+        self.patch_dim = 1 * patch_size * patch_size  # 1 channel
+        
+        # 补丁嵌入
+        self.patch_embedding = nn.Linear(self.patch_dim, dim)
+        
+        # 位置嵌入
+        self.pos_embedding = nn.Parameter(torch.randn(1, self.num_patches + 1, dim))
+        
+        # 分类标记
+        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
+        
+        # Transformer编码器
+        self.transformer = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(d_model=dim, nhead=heads, dim_feedforward=mlp_dim, dropout=0.1),
+            num_layers=depth
+        )
+        
+        # 分类头
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, num_classes)
+        )
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 输入形状: [batch, 1, 224, 224]
+        batch_size = x.shape[0]
+        
+        # 分割补丁
+        x = x.unfold(2, self.patch_size, self.patch_size).unfold(3, self.patch_size, self.patch_size)
+        x = x.contiguous().view(batch_size, -1, self.patch_dim)
+        
+        # 补丁嵌入
+        x = self.patch_embedding(x)
+        
+        # 添加分类标记
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+        x = torch.cat([cls_tokens, x], dim=1)
+        
+        # 添加位置嵌入
+        x = x + self.pos_embedding
+        
+        # 转置以适应Transformer输入格式
+        x = x.transpose(0, 1)  # [seq_len, batch, dim]
+        
+        # Transformer编码
+        x = self.transformer(x)
+        
+        # 取分类标记的输出
+        x = x[0]
+        
+        # 分类
+        x = self.classifier(x)
+        return x

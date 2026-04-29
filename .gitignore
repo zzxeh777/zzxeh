@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+
+# Virtual environment
+.venv/
+
+# Training outputs (large model files)
+outputs_*/
+*.pth
+*.pkl
+
+# Data
+data/
+uploads/
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude
+.claude/
+
+# Misc
+*.rar
+*.zip
+*.tar.gz
+python
