@@ -1,0 +1,229 @@
+#!/bin/bash
+# ============================================================
+# 远程一键训练脚本 - 在远程设备上运行
+# 自动按顺序完成: 创新点2(异构集成) → 创新点3(Stacking) → 创新点4(轻量化)
+# 训练完成后自动打包产出为 training_results.tar.gz
+# ============================================================
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+
+# ======================== 可调参数 ========================
+# 按需修改以下参数，或通过命令行覆盖
+
+SAMPLE_RATIO=0.2       # 数据采样比例 (0.2 = 20%，降低可加速训练)
+EPOCHS=30              # 训练轮数
+BATCH_SIZE=256         # 批次大小
+DEVICE="cuda"          # 训练设备 (cuda / cpu)
+
+# 创新点4 轻量化参数
+LIGHTWEIGHT_SAMPLE_RATIO=0.1
+DISTILL_EPOCHS=30
+PRUNE_RATIO=0.3
+
+# ==========================================================
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+log_info()  { echo -e "${CYAN}[INFO]${NC} $1"; }
+log_ok()    { echo -e "${GREEN}[OK]${NC} $1"; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+
+TOTAL_START=$(date +%s)
+
+echo ""
+echo "============================================================"
+echo "  恶意软件检测系统 - 远程一键训练"
+echo "  采样比例: ${SAMPLE_RATIO}  轮数: ${EPOCHS}  设备: ${DEVICE}"
+echo "============================================================"
+echo ""
+
+# ======================== Step 0: 环境检查 ========================
+log_info "Step 0: 环境检查"
+
+# 检查 Python
+if command -v python3 &>/dev/null; then
+    PYTHON=python3
+elif command -v python &>/dev/null; then
+    PYTHON=python
+else
+    log_error "未找到 Python，请先安装 Python 3.8+"
+    exit 1
+fi
+
+PYTHON_VERSION=$($PYTHON --version 2>&1)
+log_info "Python: $PYTHON_VERSION"
+
+# 检查/安装依赖
+log_info "检查依赖..."
+MISSING_PACKAGES=""
+$PYTHON -c "import torch" 2>/dev/null || MISSING_PACKAGES="$MISSING_PACKAGES torch"
+$PYTHON -c "import numpy" 2>/dev/null || MISSING_PACKAGES="$MISSING_PACKAGES numpy"
+$PYTHON -c "import sklearn" 2>/dev/null || MISSING_PACKAGES="$MISSING_PACKAGES scikit-learn"
+$PYTHON -c "import xgboost" 2>/dev/null || MISSING_PACKAGES="$MISSING_PACKAGES xgboost"
+$PYTHON -c "import tqdm" 2>/dev/null || MISSING_PACKAGES="$MISSING_PACKAGES tqdm"
+
+if [ -n "$MISSING_PACKAGES" ]; then
+    log_warn "缺少以下包:$MISSING_PACKAGES"
+    log_info "正在安装..."
+    $PYTHON -m pip install -r requirements.txt xgboost scikit-learn tqdm -q
+    log_ok "依赖安装完成"
+else
+    log_ok "所有依赖已就绪"
+fi
+
+# 检查 GPU
+GPU_INFO=$($PYTHON -c "
+import torch
+if torch.cuda.is_available():
+    print(f'{torch.cuda.get_device_name(0)} | {torch.cuda.device_count()} GPU(s)')
+else:
+    print('NO_GPU')
+" 2>/dev/null)
+
+if echo "$GPU_INFO" | grep -q "NO_GPU"; then
+    log_warn "未检测到 GPU，将使用 CPU 训练 (会很慢)"
+    DEVICE="cpu"
+else
+    log_ok "GPU: $GPU_INFO"
+fi
+
+# 检查数据文件
+log_info "检查数据文件..."
+MISSING=0
+for f in \
+    data/ember_pe/full_features/train_features.npy \
+    data/ember_pe/full_features/train_labels.npy \
+    data/ember_pe/full_features/test_features.npy \
+    data/ember_pe/full_features/test_labels.npy \
+    outputs_ember_fixed/best_optimized_model.pth; do
+    if [ ! -f "$f" ]; then
+        log_error "缺失文件: $f"
+        MISSING=1
+    fi
+done
+
+if [ $MISSING -eq 1 ]; then
+    log_error "文件不完整，请确认解压是否正确"
+    exit 1
+fi
+log_ok "数据文件就绪"
+
+echo ""
+
+# ======================== Step 1: 创新点2 - 异构集成 ========================
+STEP1_START=$(date +%s)
+echo "============================================================"
+log_info "Step 1/3: 训练异构集成模型 (MLP + CNN1D + Transformer)"
+echo "============================================================"
+
+$PYTHON train_heterogeneous_ensemble.py \
+    --data_dir ./data/ember_pe/full_features \
+    --output_dir ./outputs_heterogeneous \
+    --epochs $EPOCHS \
+    --batch_size $BATCH_SIZE \
+    --sample_ratio $SAMPLE_RATIO \
+    --device $DEVICE \
+    --model_type standard \
+    --fusion_type probability_attention \
+    --compare_single True
+
+STEP1_END=$(date +%s)
+STEP1_MIN=$(( (STEP1_END - STEP1_START) / 60 ))
+log_ok "创新点2 训练完成 (耗时 ${STEP1_MIN} 分钟)"
+
+# 检查产出
+if [ ! -f "./outputs_heterogeneous/best_heterogeneous_ensemble.pth" ]; then
+    log_error "创新点2 产出文件缺失，请检查训练日志"
+    exit 1
+fi
+
+echo ""
+
+# ======================== Step 2: 创新点3 - DL+ML Stacking ========================
+STEP2_START=$(date +%s)
+echo "============================================================"
+log_info "Step 2/3: 训练 DL+ML Stacking 集成"
+echo "============================================================"
+
+$PYTHON train_stacking_ensemble.py \
+    --data_dir ./data/ember_pe/full_features \
+    --output_dir ./outputs_stacking \
+    --base_learner_dir ./outputs_heterogeneous \
+    --epochs $EPOCHS \
+    --batch_size $BATCH_SIZE \
+    --sample_ratio $SAMPLE_RATIO \
+    --device $DEVICE
+
+STEP2_END=$(date +%s)
+STEP2_MIN=$(( (STEP2_END - STEP2_START) / 60 ))
+log_ok "创新点3 训练完成 (耗时 ${STEP2_MIN} 分钟)"
+
+echo ""
+
+# ======================== Step 3: 创新点4 - 轻量化优化 ========================
+STEP3_START=$(date +%s)
+echo "============================================================"
+log_info "Step 3/3: 训练轻量化优化模型"
+echo "============================================================"
+
+$PYTHON train_lightweight.py \
+    --data_dir ./data/ember_pe/full_features \
+    --output_dir ./outputs_lightweight \
+    --model_path ./outputs_ember_fixed/best_optimized_model.pth \
+    --sample_ratio $LIGHTWEIGHT_SAMPLE_RATIO \
+    --device $DEVICE \
+    --feature_selection True \
+    --fs_method combined \
+    --fs_top_k 500 \
+    --pruning True \
+    --prune_type unstructured \
+    --prune_ratio $PRUNE_RATIO \
+    --distillation True \
+    --distill_epochs $DISTILL_EPOCHS
+
+STEP3_END=$(date +%s)
+STEP3_MIN=$(( (STEP3_END - STEP3_START) / 60 ))
+log_ok "创新点4 训练完成 (耗时 ${STEP3_MIN} 分钟)"
+
+echo ""
+
+# ======================== Step 4: 打包产出 ========================
+log_info "打包训练产出..."
+
+tar -czf training_results.tar.gz \
+    outputs_heterogeneous/ \
+    outputs_stacking/ \
+    outputs_lightweight/
+
+if [ -f "training_results.tar.gz" ]; then
+    RESULT_SIZE=$(du -h training_results.tar.gz | cut -f1)
+    log_ok "产出已打包: training_results.tar.gz ($RESULT_SIZE)"
+else
+    log_error "打包失败，请手动拷贝 outputs_* 目录"
+fi
+
+# ======================== 完成 ========================
+TOTAL_END=$(date +%s)
+TOTAL_MIN=$(( (TOTAL_END - TOTAL_START) / 60 ))
+
+echo ""
+echo "============================================================"
+echo -e "  ${GREEN}全部训练完成!${NC}"
+echo "  总耗时: ${TOTAL_MIN} 分钟"
+echo ""
+echo "  产出文件:"
+echo "    - outputs_heterogeneous/  (创新点2)"
+echo "    - outputs_stacking/       (创新点3)"
+echo "    - outputs_lightweight/    (创新点4)"
+echo "    - training_results.tar.gz (打包)"
+echo ""
+echo "  下一步: 将 training_results.tar.gz 拷回本机"
+echo "============================================================"

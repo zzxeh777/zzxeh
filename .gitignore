@@ -1,0 +1,28 @@
+# Data files (too large for git)
+data/
+*.npy
+
+# Model checkpoints (large binary files)
+*.pth
+*.pkl
+*.pt
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Log files
+*.log
+
+# Keep JSON results
+!*/results.json
+!*/feature_selection_info.json

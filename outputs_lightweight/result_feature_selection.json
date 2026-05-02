@@ -1,0 +1,12 @@
+{
+  "params": 1090434,
+  "accuracy": 0.68483,
+  "metrics": {
+    "avg_inference_time_ms": 0.0596939999377355,
+    "throughput_samples_per_sec": 1675210.240632327,
+    "model_size_mb": 4.159675598144531,
+    "total_params": 1090434
+  },
+  "feature_dim": 2000,
+  "compression": 5.339244968907604
+}

@@ -1,0 +1,655 @@
+"""
+创新点 3: 轻量化集成优化
+实现特征筛选、权重剪枝、知识蒸馏等轻量化技术
+目标: 高精度 + 低资源消耗的恶意软件检测方案
+"""
+
+import os
+import sys
+import json
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Dict, List, Tuple, Optional
+from sklearn.feature_selection import SelectKBest, f_classif, mutual_info_classif
+import copy
+
+# 添加路径
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+
+try:
+    from src.core.models import OptimizedMalwareDetector
+    from src.core.heterogeneous_ensemble import HeterogeneousEnsembleDetector
+except ImportError:
+    pass
+
+
+class FeatureSelector:
+    """
+    特征筛选器
+    基于注意力权重和统计方法筛选重要特征
+    """
+    def __init__(self, method: str = 'attention_based'):
+        """
+        Args:
+            method: 筛选方法
+                - 'attention_based': 基于模型注意力权重
+                - 'statistical': 统计方法 (方差/F-score)
+                - 'mutual_info': 互信息
+                - 'combined': 组合方法
+        """
+        self.method = method
+        self.selected_indices = None
+        self.feature_importance = None
+        self.top_k = None
+
+    def fit(self, model: nn.Module, features: np.ndarray, labels: np.ndarray,
+            top_k: int = 500, device: str = 'cpu') -> np.ndarray:
+        """
+        训练特征选择器
+
+        Args:
+            model: 已训练的模型 (用于提取注意力权重)
+            features: 原始特征 [n_samples, n_features]
+            labels: 标签
+            top_k: 选取的特征数量
+            device: 计算设备
+
+        Returns:
+            选取的特征索引
+        """
+        self.top_k = top_k
+        n_features = features.shape[1]
+
+        print(f"\n特征筛选: 原始维度={n_features}, 目标维度={top_k}")
+        print(f"筛选方法: {self.method}")
+
+        if self.method == 'attention_based':
+            # 基于注意力权重
+            importance = self._get_attention_importance(model, features, device)
+
+        elif self.method == 'statistical':
+            # F-score 统计方法
+            selector = SelectKBest(f_classif, k=top_k)
+            selector.fit(features, labels)
+            importance = selector.scores_
+            importance = np.nan_to_num(importance, nan=0)
+
+        elif self.method == 'mutual_info':
+            # 互信息
+            selector = SelectKBest(mutual_info_classif, k=top_k)
+            selector.fit(features, labels)
+            importance = selector.scores_
+
+        elif self.method == 'combined':
+            # 组合方法: 注意力权重 + 统计方法
+            attn_importance = self._get_attention_importance(model, features, device)
+
+            # 统计方法
+            stat_selector = SelectKBest(f_classif, k=top_k)
+            stat_selector.fit(features, labels)
+            stat_importance = np.nan_to_num(stat_selector.scores_, nan=0)
+
+            # 归一化并组合
+            attn_norm = (attn_importance - attn_importance.min()) / (attn_importance.max() - attn_importance.min() + 1e-8)
+            stat_norm = (stat_importance - stat_importance.min()) / (stat_importance.max() - stat_importance.min() + 1e-8)
+
+            importance = 0.5 * attn_norm + 0.5 * stat_norm
+
+        else:
+            raise ValueError(f"未知的筛选方法: {self.method}")
+
+        self.feature_importance = importance
+
+        # 选取 Top-K 特征
+        self.selected_indices = np.argsort(importance)[-top_k:]
+
+        print(f"[OK] 筛选完成: 保留 {len(self.selected_indices)} 个重要特征")
+        print(f"  特征重要性范围: [{importance.min():.4f}, {importance.max():.4f}]")
+
+        return self.selected_indices
+
+    def _get_attention_importance(self, model: nn.Module, features: np.ndarray,
+                                   device: str) -> np.ndarray:
+        """从模型获取注意力权重作为特征重要性"""
+        model.eval()
+        model = model.to(device)
+
+        # 采样部分数据计算注意力
+        sample_size = min(1000, len(features))
+        sample_indices = np.random.choice(len(features), sample_size, replace=False)
+        sample_features = features[sample_indices]
+
+        attention_weights_list = []
+
+        with torch.no_grad():
+            batch_size = 100
+            for i in range(0, len(sample_features), batch_size):
+                batch = torch.FloatTensor(sample_features[i:i+batch_size]).to(device)
+
+                # 尝试获取注意力权重
+                try:
+                    if hasattr(model, 'feature_processor'):
+                        # OptimizedMalwareDetector
+                        _, attn_weights = model(batch)
+                        attention_weights_list.append(attn_weights.cpu().numpy())
+                    elif hasattr(model, 'attention_weights'):
+                        # 其他有注意力权重的模型
+                        _ = model(batch)
+                        attention_weights_list.append(model.attention_weights.cpu().numpy())
+                    else:
+                        # 无注意力机制的模型，使用梯度作为重要性
+                        batch.requires_grad = True
+                        outputs = model(batch)
+                        if isinstance(outputs, tuple):
+                            outputs = outputs[0]
+                        outputs.sum().backward()
+                        grad_importance = batch.grad.abs().mean(dim=0).cpu().numpy()
+                        attention_weights_list.append(np.tile(grad_importance, (len(batch), 1)))
+                except Exception as e:
+                    print(f"  获取注意力权重失败: {e}")
+                    # 使用默认重要性 (均匀)
+                    attention_weights_list.append(np.ones((len(batch), 4)) / 4)
+
+        # 平均注意力权重
+        avg_attention = np.mean(np.vstack(attention_weights_list), axis=0)
+
+        # EMBER 特征组维度映射
+        # histogram: 0-255, entropy: 256-511, strings: 512-?, general: rest
+        group_dims = {
+            'histogram': (0, 256),
+            'entropy': (256, 512),
+            'strings': (512, min(616, features.shape[1])),
+            'general': (min(616, features.shape[1]), features.shape[1])
+        }
+
+        # 根据注意力权重分配特征重要性
+        importance = np.zeros(features.shape[1])
+
+        if len(avg_attention) >= 4:
+            weights = avg_attention[:4]  # 4个特征组
+            importance[0:256] = weights[0]  # histogram
+            importance[256:512] = weights[1]  # entropy
+            importance[512:616] = weights[2] if 616 <= features.shape[1] else 0  # strings
+            importance[616:] = weights[3] if len(importance) > 616 else 0  # general
+
+        return importance
+
+    def transform(self, features: np.ndarray) -> np.ndarray:
+        """应用特征筛选"""
+        if self.selected_indices is None:
+            raise ValueError("特征选择器未训练，请先调用 fit()")
+
+        return features[:, self.selected_indices]
+
+    def get_selected_feature_info(self) -> Dict:
+        """获取选中特征的信息"""
+        return {
+            'method': self.method,
+            'top_k': self.top_k,
+            'selected_indices': self.selected_indices.tolist() if self.selected_indices is not None else None,
+            'feature_importance': self.feature_importance.tolist() if self.feature_importance is not None else None
+        }
+
+
+class WeightPruner:
+    """
+    权重剪枝器
+    实现结构化剪枝和非结构化剪枝
+    """
+    def __init__(self, prune_type: str = 'structured', prune_ratio: float = 0.3):
+        """
+        Args:
+            prune_type: 剪枝类型
+                - 'structured': 结构化剪枝 (剪枝整个通道/神经元)
+                - 'unstructured': 非结构化剪枝 (剪枝单个权重)
+                - 'global': 全局剪枝 (所有层统一阈值)
+            prune_ratio: 剪枝比例 (0-1)
+        """
+        self.prune_type = prune_type
+        self.prune_ratio = prune_ratio
+        self.pruned_model = None
+        self.pruning_info = {}
+
+    def prune(self, model: nn.Module) -> nn.Module:
+        """
+        执行剪枝
+
+        Args:
+            model: 要剪枝的模型
+
+        Returns:
+            剪枝后的模型
+        """
+        print(f"\n权重剪枝: 类型={self.prune_type}, 比例={self.prune_ratio}")
+
+        # 创建模型副本
+        self.pruned_model = copy.deepcopy(model)
+
+        original_params = sum(p.numel() for p in model.parameters())
+
+        if self.prune_type == 'structured':
+            self._structured_prune()
+        elif self.prune_type == 'unstructured':
+            self._unstructured_prune()
+        elif self.prune_type == 'global':
+            self._global_prune()
+        else:
+            raise ValueError(f"未知的剪枝类型: {self.prune_type}")
+
+        pruned_params = sum(p.numel() for p in self.pruned_model.parameters())
+        actual_ratio = (original_params - pruned_params) / original_params
+
+        self.pruning_info = {
+            'original_params': original_params,
+            'pruned_params': pruned_params,
+            'actual_prune_ratio': actual_ratio
+        }
+
+        print(f"[OK] 剪枝完成:")
+        print(f"  原始参数: {original_params:,}")
+        print(f"  剩余参数: {pruned_params:,}")
+        print(f"  实际剪枝比例: {actual_ratio:.2%}")
+
+        return self.pruned_model
+
+    def _structured_prune(self):
+        """结构化剪枝: 剪枝整个神经元/通道"""
+        import torch.nn.utils.prune as prune
+
+        for name, module in self.pruned_model.named_modules():
+            if isinstance(module, nn.Linear):
+                # 剪枝神经元 (输出维度)
+                prune.ln_structured(module, name='weight', amount=self.prune_ratio, n=2, dim=0)
+                prune.remove(module, 'weight')
+
+            elif isinstance(module, nn.Conv1d) or isinstance(module, nn.Conv2d):
+                # 剪枝通道 (输出通道)
+                prune.ln_structured(module, name='weight', amount=self.prune_ratio, n=2, dim=0)
+                prune.remove(module, 'weight')
+
+    def _unstructured_prune(self):
+        """非结构化剪枝: 剪枝单个权重"""
+        import torch.nn.utils.prune as prune
+
+        for name, module in self.pruned_model.named_modules():
+            if isinstance(module, nn.Linear) or isinstance(module, nn.Conv1d) or isinstance(module, nn.Conv2d):
+                prune.l1_unstructured(module, name='weight', amount=self.prune_ratio)
+                prune.remove(module, 'weight')
+
+    def _global_prune(self):
+        """全局剪枝: 所有层统一阈值"""
+        import torch.nn.utils.prune as prune
+
+        # 收集所有权重
+        parameters_to_prune = []
+        for name, module in self.pruned_model.named_modules():
+            if isinstance(module, nn.Linear) or isinstance(module, nn.Conv1d) or isinstance(module, nn.Conv2d):
+                parameters_to_prune.append((module, 'weight'))
+
+        if parameters_to_prune:
+            prune.global_unstructured(
+                parameters_to_prune,
+                pruning_method=prune.L1Unstructured,
+                amount=self.prune_ratio
+            )
+
+            for module, name in parameters_to_prune:
+                prune.remove(module, name)
+
+    def get_pruning_info(self) -> Dict:
+        """获取剪枝信息"""
+        return self.pruning_info
+
+
+class KnowledgeDistiller:
+    """
+    知识蒸馏器
+    用大模型指导小模型学习
+    """
+    def __init__(self, temperature: float = 4.0, alpha: float = 0.7):
+        """
+        Args:
+            temperature: 蒸馏温度 (软化输出分布)
+            alpha: 软标签权重 (0-1), 硬标签权重 = 1 - alpha
+        """
+        self.temperature = temperature
+        self.alpha = alpha
+        self.teacher_model = None
+        self.student_model = None
+
+    def setup(self, teacher: nn.Module, student: nn.Module, device: str = 'cpu'):
+        """设置教师和学生模型"""
+        self.teacher_model = teacher.to(device)
+        self.teacher_model.eval()
+
+        self.student_model = student.to(device)
+
+        print(f"\n知识蒸馏设置:")
+        print(f"  温度: {self.temperature}")
+        print(f"  软标签权重: {self.alpha}")
+
+        teacher_params = sum(p.numel() for p in teacher.parameters())
+        student_params = sum(p.numel() for p in student.parameters())
+
+        print(f"  教师模型参数: {teacher_params:,}")
+        print(f"  学生模型参数: {student_params:,}")
+        print(f"  压缩比例: {student_params/teacher_params:.2%}")
+
+    def distillation_loss(self, student_outputs: torch.Tensor,
+                          teacher_outputs: torch.Tensor,
+                          labels: torch.Tensor) -> torch.Tensor:
+        """
+        计算蒸馏损失
+
+        Args:
+            student_outputs: 学生模型 logits
+            teacher_outputs: 教师模型 logits
+            labels: 真实标签
+
+        Returns:
+            蒸馏损失
+        """
+        # 软标签损失 (KL散度)
+        soft_loss = F.kl_div(
+            F.log_softmax(student_outputs / self.temperature, dim=1),
+            F.softmax(teacher_outputs / self.temperature, dim=1),
+            reduction='batchmean'
+        ) * (self.temperature ** 2)
+
+        # 硬标签损失
+        hard_loss = F.cross_entropy(student_outputs, labels)
+
+        # 组合损失
+        total_loss = self.alpha * soft_loss + (1 - self.alpha) * hard_loss
+
+        return total_loss
+
+    def train_step(self, batch: torch.Tensor, labels: torch.Tensor,
+                   optimizer: torch.optim.Optimizer) -> float:
+        """单步蒸馏训练"""
+        self.student_model.train()
+
+        optimizer.zero_grad()
+
+        # 教师模型预测
+        with torch.no_grad():
+            teacher_outputs = self.teacher_model(batch)
+            if isinstance(teacher_outputs, tuple):
+                teacher_outputs = teacher_outputs[0] if teacher_outputs[0].dim() == 2 else teacher_outputs[1]
+
+        # 学生模型预测
+        student_outputs = self.student_model(batch)
+        if isinstance(student_outputs, tuple):
+            student_outputs = student_outputs[0] if student_outputs[0].dim() == 2 else student_outputs[1]
+
+        # 蒸馏损失
+        loss = self.distillation_loss(student_outputs, teacher_outputs, labels)
+
+        loss.backward()
+        optimizer.step()
+
+        return loss.item()
+
+
+class LightweightOptimizer:
+    """
+    轻量化优化器
+    整合特征筛选、权重剪枝、知识蒸馏
+    """
+    def __init__(self, config: Dict = None):
+        """
+        Args:
+            config: 配置字典
+                - feature_selection: 特征筛选配置
+                - pruning: 剪枝配置
+                - distillation: 蒸馏配置
+        """
+        self.config = config or {
+            'feature_selection': {
+                'enabled': True,
+                'method': 'combined',
+                'top_k': 500
+            },
+            'pruning': {
+                'enabled': True,
+                'type': 'structured',
+                'ratio': 0.3
+            },
+            'distillation': {
+                'enabled': True,
+                'temperature': 4.0,
+                'alpha': 0.7
+            }
+        }
+
+        self.feature_selector = None
+        self.weight_pruner = None
+        self.distiller = None
+
+    def optimize(self, model: nn.Module, features: np.ndarray, labels: np.ndarray,
+                 device: str = 'cpu') -> Tuple[nn.Module, Dict]:
+        """
+        执行完整轻量化优化流程
+
+        Args:
+            model: 原始模型
+            features: 特征数据
+            labels: 标签数据
+            device: 计算设备
+
+        Returns:
+            (优化后的模型, 优化信息)
+        """
+        print("\n" + "=" * 60)
+        print("轻量化优化流程")
+        print("=" * 60)
+
+        optimization_info = {
+            'original_params': sum(p.numel() for p in model.parameters()),
+            'steps': {}
+        }
+
+        optimized_model = model
+
+        # Step 1: 特征筛选
+        if self.config['feature_selection']['enabled']:
+            print("\n[Step 1] 特征筛选")
+
+            self.feature_selector = FeatureSelector(
+                method=self.config['feature_selection']['method']
+            )
+            selected_indices = self.feature_selector.fit(
+                model, features, labels,
+                top_k=self.config['feature_selection']['top_k'],
+                device=device
+            )
+
+            optimization_info['steps']['feature_selection'] = self.feature_selector.get_selected_feature_info()
+            optimization_info['feature_dim_reduction'] = {
+                'original': features.shape[1],
+                'optimized': len(selected_indices)
+            }
+
+        # Step 2: 权重剪枝
+        if self.config['pruning']['enabled']:
+            print("\n[Step 2] 权重剪枝")
+
+            self.weight_pruner = WeightPruner(
+                prune_type=self.config['pruning']['type'],
+                prune_ratio=self.config['pruning']['ratio']
+            )
+            optimized_model = self.weight_pruner.prune(optimized_model)
+
+            optimization_info['steps']['pruning'] = self.weight_pruner.get_pruning_info()
+
+        # Step 3: 知识蒸馏 (需要训练)
+        # 蒸馏需要额外训练，这里只设置
+        if self.config['distillation']['enabled']:
+            print("\n[Step 3] 知识蒸馏配置")
+
+            self.distiller = KnowledgeDistiller(
+                temperature=self.config['distillation']['temperature'],
+                alpha=self.config['distillation']['alpha']
+            )
+            # self.distiller.setup(teacher=model, student=optimized_model, device=device)
+
+            optimization_info['steps']['distillation'] = {
+                'temperature': self.config['distillation']['temperature'],
+                'alpha': self.config['distillation']['alpha'],
+                'status': 'configured (需要额外训练)'
+            }
+
+        # 最终统计
+        optimized_params = sum(p.numel() for p in optimized_model.parameters())
+        compression_ratio = optimized_params / optimization_info['original_params']
+
+        optimization_info['optimized_params'] = optimized_params
+        optimization_info['compression_ratio'] = compression_ratio
+
+        print("\n" + "=" * 60)
+        print("轻量化优化完成")
+        print("=" * 60)
+        print(f"原始参数: {optimization_info['original_params']:,}")
+        print(f"优化后参数: {optimized_params:,}")
+        print(f"压缩比例: {compression_ratio:.2%}")
+
+        return optimized_model, optimization_info
+
+    def save_optimization_info(self, path: str):
+        """保存优化信息"""
+        with open(path, 'w') as f:
+            json.dump(self.config, f, indent=2)
+        print(f"[OK] 优化配置已保存: {path}")
+
+
+def benchmark_inference(model: nn.Module, features: np.ndarray,
+                         batch_size: int = 100, iterations: int = 50,
+                         device: str = 'cpu') -> Dict:
+    """
+    推理性能基准测试
+
+    Args:
+        model: 模型
+        features: 测试特征
+        batch_size: 测试批次大小
+        iterations: 测试迭代次数
+        device: 计算设备
+
+    Returns:
+        性能指标
+    """
+    import time
+
+    print("\n推理性能基准测试")
+
+    model.eval()
+    model = model.to(device)
+
+    # 预热
+    warmup_batch = torch.FloatTensor(features[:batch_size]).to(device)
+    with torch.no_grad():
+        for _ in range(5):
+            outputs = model(warmup_batch)
+            if isinstance(outputs, tuple):
+                outputs = outputs[0]
+
+    # 测试
+    times = []
+    with torch.no_grad():
+        for i in range(iterations):
+            batch = torch.FloatTensor(features[i*batch_size:(i+1)*batch_size]).to(device)
+
+            start = time.perf_counter()
+            outputs = model(batch)
+            if isinstance(outputs, tuple):
+                outputs = outputs[0]
+            end = time.perf_counter()
+
+            times.append(end - start)
+
+    # 计算指标
+    avg_time_ms = np.mean(times) * 1000
+    throughput = batch_size / np.mean(times)
+
+    # 模型大小
+    param_size = sum(p.numel() * p.element_size() for p in model.parameters()) / (1024 * 1024)
+
+    metrics = {
+        'avg_inference_time_ms': avg_time_ms,
+        'throughput_samples_per_sec': throughput,
+        'model_size_mb': param_size,
+        'total_params': sum(p.numel() for p in model.parameters())
+    }
+
+    print(f"  平均推理时间: {avg_time_ms:.2f} ms")
+    print(f"  吞吐量: {throughput:.2f} samples/sec")
+    print(f"  模型大小: {param_size:.2f} MB")
+
+    return metrics
+
+
+# ============ 测试代码 ============
+if __name__ == "__main__":
+    print("\n" + "=" * 60)
+    print("轻量化优化模块测试")
+    print("=" * 60)
+
+    # 模拟数据
+    n_samples = 1000
+    n_features = 2381
+    features = np.random.randn(n_samples, n_features)
+    labels = np.random.randint(0, 2, n_samples)
+
+    # 测试特征筛选
+    print("\n测试 FeatureSelector:")
+    selector = FeatureSelector(method='statistical')
+    indices = selector.fit(None, features, labels, top_k=500)
+    selected_features = selector.transform(features)
+    print(f"筛选后特征维度: {selected_features.shape}")
+
+    # 测试权重剪枝
+    print("\n测试 WeightPruner:")
+    # 创建简单模型
+    simple_model = nn.Sequential(
+        nn.Linear(2381, 256),
+        nn.ReLU(),
+        nn.Linear(256, 128),
+        nn.ReLU(),
+        nn.Linear(128, 2)
+    )
+
+    pruner = WeightPruner(prune_type='unstructured', prune_ratio=0.3)
+    pruned_model = pruner.prune(simple_model)
+
+    # 测试知识蒸馏
+    print("\n测试 KnowledgeDistiller:")
+    teacher = nn.Linear(2381, 2)
+    student = nn.Linear(2381, 2)
+
+    distiller = KnowledgeDistiller(temperature=4.0, alpha=0.7)
+    distiller.setup(teacher, student, device='cpu')
+
+    # 测试蒸馏损失
+    batch = torch.randn(10, 2381)
+    labels_batch = torch.randint(0, 2, (10,))
+
+    teacher_out = teacher(batch)
+    student_out = student(batch)
+
+    loss = distiller.distillation_loss(student_out, teacher_out, labels_batch)
+    print(f"蒸馏损失: {loss.item():.4f}")
+
+    # 测试完整优化流程
+    print("\n测试 LightweightOptimizer:")
+    optimizer = LightweightOptimizer()
+    optimized_model, info = optimizer.optimize(simple_model, features, labels)
+
+    # 测试推理基准
+    print("\n测试 benchmark_inference:")
+    metrics = benchmark_inference(simple_model, features[:500], batch_size=50)
+
+    print("\n" + "=" * 60)
+    print("[OK] 轻量化优化模块测试通过!")
+    print("=" * 60)
