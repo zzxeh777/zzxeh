@@ -1,0 +1,28 @@
+{
+  "original": {
+    "params": 204230
+  },
+  "feature_selection": {
+    "params": 1090434,
+    "accuracy": 0.68483,
+    "metrics": {
+      "avg_inference_time_ms": 0.0596939999377355,
+      "throughput_samples_per_sec": 1675210.240632327,
+      "model_size_mb": 4.159675598144531,
+      "total_params": 1090434
+    },
+    "feature_dim": 2000,
+    "compression": 5.339244968907604
+  },
+  "distillation": {
+    "params": 376762,
+    "accuracy": 0.79887,
+    "metrics": {
+      "avg_inference_time_ms": 0.21545000025071204,
+      "throughput_samples_per_sec": 464144.81264160277,
+      "model_size_mb": 1.4372329711914062,
+      "total_params": 376762
+    },
+    "compression": 1.844792635753807
+  }
+}
